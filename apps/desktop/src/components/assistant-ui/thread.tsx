@@ -96,6 +96,7 @@ import { extractPreviewTargets } from '@/lib/preview-targets'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { playSpeechText, stopVoicePlayback } from '@/lib/voice-playback'
+import { $backgroundResumePendingCount } from '@/store/background-delegation'
 import { $compactionActive } from '@/store/compaction'
 import type { ComposerAttachment } from '@/store/composer'
 import { notifyError } from '@/store/notifications'
@@ -243,7 +244,7 @@ export const Thread: FC<{
         clampToComposer={clampToComposer}
         components={messageComponents}
         emptyPlaceholder={emptyPlaceholder}
-        loadingIndicator={loading === 'response' ? <ResponseLoadingIndicator /> : null}
+        loadingIndicator={loading === 'response' ? <ResponseLoadingIndicator /> : <BackgroundResumeNotice />}
         sessionKey={sessionKey}
       />
       {loading === 'session' && <CenteredThreadSpinner />}
@@ -418,6 +419,33 @@ const ResponseLoadingIndicator: FC = () => {
       <span aria-hidden="true" className="dither inline-block size-3 rounded-[2px] text-midground/80 animate-pulse" />
       {compacting && <CompactionHint />}
       <ActivityTimerText seconds={elapsed} />
+    </StatusRow>
+  )
+}
+
+// Parked-background affordance: a top-level delegate_task runs in the
+// background, so the parent turn ends and the app goes idle while the subagent
+// keeps working and its result re-enters as a fresh turn later. Instead of a
+// spinner (which reads as "stuck"), show a calm, static "will resume" line at
+// the tail of the transcript — and only while idle, so an active turn's own
+// loader is never doubled up. Returns null when nothing is parked.
+const BackgroundResumeNotice: FC = () => {
+  const { t } = useI18n()
+  const pending = useStore($backgroundResumePendingCount)
+
+  if (pending <= 0) {
+    return null
+  }
+
+  const label = t.assistant.thread.resumeWhenBackgroundDone(pending)
+
+  return (
+    <StatusRow data-slot="aui_background-resume" label={label}>
+      <span
+        aria-hidden="true"
+        className="inline-block size-2 shrink-0 rounded-full border border-midground/70 bg-midground/25"
+      />
+      <span className="min-w-0 truncate">{label}</span>
     </StatusRow>
   )
 }
