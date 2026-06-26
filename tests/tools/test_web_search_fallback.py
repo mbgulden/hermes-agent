@@ -63,17 +63,29 @@ def test_get_backend_chain_returns_configured_first(web_tools):
 
 
 def test_get_backend_chain_auto_detect_order(web_tools):
-    """Auto-detect walks the canonical fallback chain in order."""
+    """Auto-detect walks the canonical fallback chain in order.
+
+    Order is grouped by credit refresh cadence: monthly-refresh tiers
+    first (tavily → brave-free → firecrawl), one-time credits
+    next (exa), then always-available last-resort backends
+    (searxng if URL is set, ddgs if installed). The goal is to keep
+    monthly-refresh keys alive as long as possible and only consume
+    the one-time Exa credit when every monthly tier has been exhausted.
+    """
     os.environ["TAVILY_API_KEY"] = "test-tavily"
     os.environ["BRAVE_SEARCH_API_KEY"] = "test-brave"
+    os.environ["FIRECRAWL_API_KEY"] = "test-firecrawl"
 
     web_tools._load_web_config = lambda: {}
 
     chain = web_tools._get_backend_chain()
-    # Tavily should come before Brave in canonical priority
-    tavily_idx = chain.index("tavily")
-    brave_idx = chain.index("brave-free")
-    assert tavily_idx < brave_idx, f"chain order wrong: {chain}"
+    # Monthly-refresh group first
+    assert chain.index("tavily") < chain.index("brave-free"), f"chain order wrong: {chain}"
+    assert chain.index("brave-free") < chain.index("firecrawl"), f"chain order wrong: {chain}"
+    # One-time credits after monthly tiers
+    os.environ["EXA_API_KEY"] = "test-exa"
+    chain = web_tools._get_backend_chain()
+    assert chain.index("firecrawl") < chain.index("exa"), f"exa should be after firecrawl: {chain}"
 
 
 def test_get_backend_chain_excludes_unavailable(web_tools):
@@ -146,7 +158,12 @@ def test_get_backend_chain_handles_empty_env(web_tools):
 
 
 def test_get_backend_chain_with_searxng(web_tools):
-    """SearXNG appears in chain when SEARXNG_URL is set."""
+    """SearXNG appears in chain when SEARXNG_URL is set.
+
+    SearXNG isn't in the default _FALLBACK_CHAIN (it requires a user-provided
+    URL to a public instance), but it should still appear in the chain when
+    explicitly configured.
+    """
     os.environ["SEARXNG_URL"] = "https://searx.example.com"
     os.environ["TAVILY_API_KEY"] = "test-tavily"
 
@@ -154,6 +171,3 @@ def test_get_backend_chain_with_searxng(web_tools):
 
     chain = web_tools._get_backend_chain()
     assert "searxng" in chain
-    # Canonical order: tavily before searxng before brave-free
-    if "tavily" in chain:
-        assert chain.index("tavily") < chain.index("searxng")

@@ -161,16 +161,34 @@ def _get_backend() -> str:
     return chain[0] if chain else "firecrawl"
 
 
-# Default fallback order. Configured backend takes precedence; if it's
-# unavailable or fails at runtime, callers that use `_get_backend_chain()`
-# walk through this list to find another working option.
+# Default fallback order. The chain is grouped by **credit refresh cadence**
+# so that backends whose free quota refreshes every month burn down before
+# backends whose quota is one-time only — users want monthly-refresh
+# keys to stay alive as long as possible, and to fall through to the
+# one-time credits only when monthly tiers are exhausted.
+#
+# Group 1 — Monthly-refresh free tiers (use these first, refresh monthly):
+#     tavily    (1,000 credits / month)
+#     brave-free ($5 credit / month)
+#     firecrawl  (500 extract + 5,000 search credits / month)
+#
+# Group 2 — One-time signup credits (use only after monthly tiers exhaust):
+#     exa        ($10 signup credit, ~1,400 searches)
+#
+# Group 3 — Always-available / unlimited last resort:
+#     searxng   (requires SEARXNG_URL to a public instance; quality varies)
+#     ddgs      (no quota, no API key — DuckDuckGo; unlimited but lower quality)
+#
+# The runtime retry logic in ``web_search_tool`` walks this list and
+# returns the first non-failing response. See :func:`_get_backend_chain`
+# for the per-call resolution (which also respects ``web.backend`` as
+# position 1).
 _FALLBACK_CHAIN = (
     "tavily",
-    "exa",
-    "parallel",
-    "firecrawl",
-    "searxng",
     "brave-free",
+    "firecrawl",
+    "exa",
+    "searxng",
     "ddgs",
 )
 
