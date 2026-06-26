@@ -147,33 +147,74 @@ def _get_backend() -> str:
     Reads ``web.backend`` from config.yaml (set by ``hermes tools``).
     Falls back to whichever API key is present for users who configured
     keys manually without running setup.
+
+    For multi-key setups (e.g. Tavily + Brave + ddgs), use
+    :func:`_get_backend_chain` instead — this function only returns the
+    first available backend, which is the right choice when callers don't
+    implement per-call retry-on-failure logic.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
     if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai"}:
         return configured
 
-    # Fallback for manual / legacy config — pick the highest-priority
-    # available backend. Explicit user credentials (TAVILY_API_KEY etc.)
-    # beat the managed-tool-gateway probe so a deliberate setup is not
-    # pre-empted by a Nous OAuth token whose subscription tier may not
-    # actually grant web-search access (the gateway then fails at runtime
-    # with "no subscription" and the tool returns an error to the agent
-    # without falling back). Free-tier backends trail the paid ones.
-    backend_candidates = (
-        ("tavily", _has_env("TAVILY_API_KEY")),
-        ("exa", _has_env("EXA_API_KEY")),
-        ("parallel", _has_env("PARALLEL_API_KEY")),
-        ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL")),
-        ("firecrawl", _is_tool_gateway_ready()),
-        ("searxng", _has_env("SEARXNG_URL")),
-        ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
-        ("ddgs", _ddgs_package_importable()),
-    )
-    for backend, available in backend_candidates:
-        if available:
-            return backend
+    chain = _get_backend_chain()
+    return chain[0] if chain else "firecrawl"
 
-    return "firecrawl"  # default (backward compat)
+
+# Default fallback order. Configured backend takes precedence; if it's
+# unavailable or fails at runtime, callers that use `_get_backend_chain()`
+# walk through this list to find another working option.
+_FALLBACK_CHAIN = (
+    "tavily",
+    "exa",
+    "parallel",
+    "firecrawl",
+    "searxng",
+    "brave-free",
+    "ddgs",
+)
+
+
+def _get_backend_chain() -> List[str]:
+    """Return all available web backends in priority order.
+
+    Mirrors the selection priority of :func:`_get_backend` but returns
+    the full chain instead of just the first match, so callers can
+    walk through them when the primary backend fails at runtime
+    (rate limit, quota exhausted, 401/403, etc.).
+
+    Order of preference:
+
+    1. ``web.backend`` from config.yaml (if set and available), then
+       the remaining backends in :data:`_FALLBACK_CHAIN` order.
+    2. Auto-detected from env vars, in :data:`_FALLBACK_CHAIN` order.
+
+    Free-tier backends trail paid ones — paid tiers should burn down
+    first since the user is paying for them; ddgs is the universal
+    last-resort fallback (no API key required).
+    """
+    configured = (_load_web_config().get("backend") or "").lower().strip()
+    chain: List[str] = []
+    seen = set()
+
+    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai"}:
+        if _is_backend_available(configured):
+            chain.append(configured)
+            seen.add(configured)
+        # Then add the standard fallback chain, skipping the configured one
+        # and any backends that aren't actually available (no API key, etc.)
+        for backend in _FALLBACK_CHAIN:
+            if backend not in seen and _is_backend_available(backend):
+                chain.append(backend)
+                seen.add(backend)
+    else:
+        # Auto-detect from env vars
+        for backend in _FALLBACK_CHAIN:
+            if backend not in seen and _is_backend_available(backend):
+                chain.append(backend)
+                seen.add(backend)
+
+    return chain
 
 
 def _get_search_backend() -> str:
@@ -240,6 +281,35 @@ def _is_backend_available(backend: str) -> bool:
             return has_xai_credentials()
         except Exception:
             return False
+    return False
+
+
+def _is_backend_failure(response_data) -> bool:
+    """Return True when a search-provider response indicates a backend failure.
+
+    Used by the runtime fallback loop in :func:`web_search_tool` to decide
+    whether to try the next backend in the chain. The contract is:
+
+    - A response with ``success != False`` and a non-empty ``data.web``
+      is a successful search (return False — do not retry).
+    - A response with ``success != False`` and an empty ``data.web`` is
+      a legitimate zero-result response (return False — the answer is
+      genuinely empty, not a backend failure).
+    - A response with ``success == False`` is a backend failure (rate
+      limit, quota exhausted, auth error, network error, parse error,
+      etc.) — return True so the caller tries the next backend.
+
+    This deliberately only flags hard failures. Quota-exceeded responses
+    typically carry ``success: false`` with the backend's own retry hint
+    in ``error`` — falling through to a different backend is exactly
+    what the user wants when one tier is exhausted.
+    """
+    if not isinstance(response_data, dict):
+        # Anything non-dict is unexpected — treat as failure so we retry
+        # rather than silently return garbage to the agent.
+        return True
+    if response_data.get("success") is False:
+        return True
     return False
 
 
@@ -872,6 +942,60 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 provider.name, query, limit,
             )
             response_data = provider.search(query, limit)
+
+            # Runtime fallback: if the primary backend returned a failure
+            # (rate limit, quota exhausted, auth error, network error, etc.),
+            # try the next backend in the chain. This lets a user stack
+            # multiple paid/free keys and have them auto-fallthrough rather
+            # than silently failing when the primary tier runs out.
+            #
+            # Skip the retry loop entirely when the response was successful
+            # OR when the provider explicitly returned zero results (that's
+            # not a backend failure — the answer is genuinely empty).
+            if not _is_backend_failure(response_data):
+                logger.info(
+                    "Web search primary backend %s returned %d result(s); "
+                    "no fallback needed.",
+                    backend,
+                    len(response_data.get("data", {}).get("web", [])),
+                )
+            else:
+                chain = _get_backend_chain()
+                # Walk through the chain, skipping the backend we already tried
+                for next_backend in chain:
+                    if next_backend == backend:
+                        continue
+                    next_provider = _wsp_get_provider(next_backend)
+                    if next_provider is None or not next_provider.supports_search():
+                        continue
+                    logger.info(
+                        "Web search primary backend %s failed; "
+                        "retrying with %s: '%s' (limit: %d)",
+                        backend, next_backend, query, limit,
+                    )
+                    try:
+                        next_response = next_provider.search(query, limit)
+                    except Exception as retry_err:
+                        logger.debug(
+                            "Backend %s raised during fallback retry: %s",
+                            next_backend, retry_err,
+                        )
+                        continue
+                    if not _is_backend_failure(next_response):
+                        response_data = next_response
+                        backend = next_backend  # for the log line below
+                        logger.info(
+                            "Web search fallback backend %s returned %d result(s).",
+                            backend,
+                            len(response_data.get("data", {}).get("web", [])),
+                        )
+                        break
+                else:
+                    logger.warning(
+                        "Web search exhausted fallback chain for query '%s'; "
+                        "returning primary backend's failure.",
+                        query,
+                    )
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
