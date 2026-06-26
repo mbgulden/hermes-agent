@@ -1122,6 +1122,138 @@ def run_doctor(args):
     except Exception:
         pass
 
+    _section("Gateway Process Env")
+    # Each hermes gateway is a long-running process that loaded its config
+    # at startup. If an API key was added to ~/.hermes/.env AFTER the
+    # gateway was launched, the gateway subprocess will still see the
+    # old (empty) value because env is inherited once at exec time.
+    # Real symptom observed: vision_analyze returning 401 from
+    # api.minimax.io because MINIMAX_API_KEY was set in .env but the
+    # gateway's /proc/<pid>/environ didn't have it. Connectivity probes
+    # above pass (they run in this fresh doctor process which inherits
+    # the current shell env), so the user sees "API Connectivity: OK" but
+    # vision still fails. This check inspects the actual gateway PIDs.
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+        from hermes_cli.config import get_env_value
+
+        # Collect (env_var_name, friendly_label) for every api-key provider.
+        _provider_env_vars: list = []
+        try:
+            for _prov_id, _pconf in PROVIDER_REGISTRY.items():
+                if getattr(_pconf, "auth_type", "") != "api_key":
+                    continue
+                _label = getattr(_pconf, "name", _prov_id) or _prov_id
+                for _ev in (_pconf.api_key_env_vars or ()):
+                    _provider_env_vars.append((_ev, _label))
+        except Exception:
+            pass
+        # Also include auxiliary.<task>.api_key_env entries.
+        try:
+            from hermes_cli.config import load_config
+            _aux_cfg = load_config().get("auxiliary", {}) or {}
+            if isinstance(_aux_cfg, dict):
+                for _task, _task_cfg in _aux_cfg.items():
+                    if not isinstance(_task_cfg, dict):
+                        continue
+                    _ev = str(_task_cfg.get("api_key_env") or "").strip()
+                    if not _ev:
+                        continue
+                    _provider_env_vars.append((_ev, f"auxiliary.{_task}"))
+        except Exception:
+            pass
+
+        if not _provider_env_vars:
+            check_info("No api_key_env entries to check")
+        else:
+            # Find every running hermes gateway process and read its /proc env.
+            import subprocess as _sp
+            _pgrep = _sp.run(
+                ["pgrep", "-af", "hermes.*gateway run"],
+                capture_output=True, text=True, timeout=5,
+            )
+            _gateway_lines: list = []
+            for _line in (_pgrep.stdout or "").splitlines():
+                _parts = _line.split(None, 1)
+                if len(_parts) != 2:
+                    continue
+                try:
+                    _pid = int(_parts[0])
+                except ValueError:
+                    continue
+                try:
+                    with open(f"/proc/{_pid}/environ", "rb") as _f:
+                        _env_bytes = _f.read().split(b"\0")
+                except (FileNotFoundError, ProcessLookupError, PermissionError):
+                    continue
+                _env_set = {_e.split(b"=", 1)[0].decode("utf-8", "ignore")
+                            for _e in _env_bytes if b"=" in _e}
+                _env_values: dict = {}
+                for _e in _env_bytes:
+                    if b"=" in _e:
+                        _k, _, _v = _e.partition(b"=")
+                        _env_values[_k.decode("utf-8", "ignore")] = _v.decode("utf-8", "ignore")
+
+                # Extract profile name from cmdline (best-effort).
+                _cmdline = ""
+                try:
+                    with open(f"/proc/{_pid}/cmdline", "rb") as _cf:
+                        _cmdline = _cf.read().replace(b"\0", b" ").decode("utf-8", "ignore")
+                except Exception:
+                    pass
+                _profile = "?"
+                if "--profile" in _cmdline:
+                    try:
+                        _profile = _cmdline.split("--profile", 1)[1].split()[0]
+                    except Exception:
+                        pass
+
+                _gateway_lines.append((_pid, _profile, _env_set, _env_values))
+
+            if not _gateway_lines:
+                check_warn(
+                    "No running hermes gateway processes found",
+                    "(skipping per-process env check; connectivity may still pass)",
+                )
+            else:
+                _missing_per_gateway: list = []
+                for _pid, _profile, _env_set, _env_values in _gateway_lines:
+                    _missing: list = []
+                    for _ev, _label in _provider_env_vars:
+                        if _ev in _env_set and _env_values.get(_ev, "").strip():
+                            continue
+                        # .env has it but gateway doesn't → stale gateway
+                        _in_dotenv = bool(str(get_env_value(_ev) or "").strip())
+                        if _in_dotenv:
+                            _missing.append(_ev)
+                    if _missing:
+                        _missing_per_gateway.append((_pid, _profile, _missing))
+
+                if not _missing_per_gateway:
+                    for _pid, _profile, _env_set, _env_values in _gateway_lines:
+                        check_ok(
+                            f"Gateway profile='{_profile}' pid={_pid}",
+                            "(all api_key_env vars present)",
+                        )
+                else:
+                    for _pid, _profile, _missing in _missing_per_gateway:
+                        _missing_str = ", ".join(_missing)
+                        check_warn(
+                            f"Gateway profile='{_profile}' pid={_pid}",
+                            f"(missing env vars set in ~/.hermes/.env: {_missing_str})",
+                        )
+                        _restart_hint = (
+                            f"Restart the gateway (systemctl restart hermes-...) "
+                            f"so the new .env is loaded into the gateway process."
+                        )
+                        check_info(_restart_hint)
+                        issues.append(
+                            f"Gateway profile '{_profile}' (pid {_pid}) lacks: {_missing_str}. "
+                            f"Restart to load updated .env."
+                        )
+    except Exception as _e:
+        check_warn("Could not inspect gateway process env", f"({_e})")
+
     _section("Directory Structure")
     hermes_home = HERMES_HOME
     if hermes_home.exists():
