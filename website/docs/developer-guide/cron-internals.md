@@ -213,6 +213,8 @@ The script timeout defaults to 120 seconds. `_get_script_timeout()` resolves the
 3. **Config** — `cron.script_timeout_seconds` in `config.yaml` (read via `load_config()`)
 4. **Default** — 120 seconds
 
+Script stdout can also act as a wake gate. If the last non-empty stdout line is `{"wakeAgent": false}` or the literal `EMPTY`, the scheduler skips the agent entirely and suppresses delivery. Use `EMPTY` for scanner-style jobs whose empty queue is already the complete result; this prevents Hermes from wrapping the empty queue in a contradictory task-execution prompt.
+
 ### Provider Recovery
 
 `run_job()` passes the user's configured fallback providers and credential pool into the `AIAgent` instance:
