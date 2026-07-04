@@ -1665,9 +1665,10 @@ def _parse_wake_gate(script_output: str) -> bool:
     as a wake gate.
 
     The convention (ported from nanoclaw #1232): if the last stdout line is
-    JSON like ``{"wakeAgent": false}``, the agent is skipped entirely — no
-    LLM run, no delivery. Any other output (non-JSON, missing flag, gate
-    absent, or ``wakeAgent: true``) means wake the agent normally.
+    JSON like ``{"wakeAgent": false}``, or the literal sentinel ``EMPTY``,
+    the agent is skipped entirely — no LLM run, no delivery. Any other output
+    (non-JSON, missing flag, gate absent, or ``wakeAgent: true``) means wake
+    the agent normally.
 
     Returns True if the agent should wake, False to skip.
     """
@@ -1677,6 +1678,8 @@ def _parse_wake_gate(script_output: str) -> bool:
     if not stripped_lines:
         return True
     last_line = stripped_lines[-1].strip()
+    if last_line == "EMPTY":
+        return False
     try:
         gate = json.loads(last_line)
     except (json.JSONDecodeError, ValueError):
@@ -1686,7 +1689,7 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
-def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
+def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> Optional[str]:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
     Args:
@@ -1716,14 +1719,27 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             success, script_output = _run_job_script(script_path)
         if success:
             if script_output:
-                prompt = (
-                    "## Script Output\n"
-                    "The following data was collected by a pre-run script. "
-                    "Use it as context for your analysis.\n\n"
-                    f"```\n{script_output}\n```\n\n"
-                    f"{prompt}"
-                )
-                has_injected_data = True
+                stripped_lines = [line for line in script_output.splitlines() if line.strip()]
+                is_empty = False
+                if stripped_lines and stripped_lines[-1].strip() == "EMPTY":
+                    is_empty = True
+
+                if is_empty:
+                    # EMPTY is a machine-readable script sentinel: no queue,
+                    # no agent wakeup, no wrapper prompt. Keep this aligned
+                    # with _parse_wake_gate() so direct _build_job_prompt()
+                    # callers cannot reintroduce the old contradictory
+                    # "queue empty" + "task detected" prompt.
+                    return None
+                else:
+                    prompt = (
+                        "## Script Output\n"
+                        "The following data was collected by a pre-run script. "
+                        "Use it as context for your analysis.\n\n"
+                        f"```\n{script_output}\n```\n\n"
+                        f"{prompt}"
+                    )
+                    has_injected_data = True
             else:
                 # Script produced no output — nothing to report, skip AI call.
                 return None

@@ -5106,6 +5106,7 @@ def _resolve_task_provider_model(
     cfg_model = None
     cfg_base_url = None
     cfg_api_key = None
+    cfg_api_key_env = None
     cfg_api_mode = None
 
     if task:
@@ -5114,6 +5115,28 @@ def _resolve_task_provider_model(
         cfg_model = str(task_config.get("model", "")).strip() or None
         cfg_base_url = str(task_config.get("base_url", "")).strip() or None
         cfg_api_key = str(task_config.get("api_key", "")).strip() or None
+        # Resolve api_key_env eagerly so the rest of the function can use
+        # cfg_api_key consistently. If neither api_key nor api_key_env is
+        # set, cfg_api_key stays None and downstream resolution will hit
+        # the provider-registry path (or "auto" if no provider is known).
+        cfg_api_key_env = str(
+            task_config.get("api_key_env")
+            or task_config.get("key_env")
+            or ""
+        ).strip() or None
+        if cfg_api_key is None and cfg_api_key_env:
+            try:
+                from hermes_cli.config import get_env_value
+                _resolved = get_env_value(cfg_api_key_env)
+                if _resolved:
+                    cfg_api_key = str(_resolved).strip() or None
+            except Exception:
+                # hermes_cli may not be importable in some test contexts;
+                # fall through to os.environ as a last resort.
+                import os as _os
+                _resolved = _os.environ.get(cfg_api_key_env, "")
+                if _resolved.strip():
+                    cfg_api_key = _resolved.strip()
         cfg_api_mode = str(task_config.get("api_mode", "")).strip() or None
 
     resolved_model = model or cfg_model
@@ -5149,9 +5172,14 @@ def _resolve_task_provider_model(
             # Both base_url and api_key explicitly set → custom endpoint.
             return "custom", resolved_model, cfg_base_url, cfg_api_key, resolved_api_mode
         if cfg_base_url and cfg_provider and cfg_provider != "auto":
-            # base_url set without api_key but with a known provider — use
-            # the provider so it can resolve credentials from env vars
-            # (e.g. OPENROUTER_API_KEY) instead of locking into "custom".
+            # base_url set with a known provider but no api_key directly in
+            # config. If api_key_env resolved to a value above, pass it
+            # through so the custom provider can use it. Otherwise fall back
+            # to the provider-registry resolution path (which will look up
+            # the provider's configured api_key_env_vars) instead of
+            # locking into "custom" with api_key=None.
+            if cfg_api_key:
+                return "custom", resolved_model, cfg_base_url, cfg_api_key, resolved_api_mode
             return cfg_provider, resolved_model, cfg_base_url, None, resolved_api_mode
         if cfg_provider and cfg_provider != "auto":
             return cfg_provider, resolved_model, cfg_base_url, cfg_api_key, resolved_api_mode

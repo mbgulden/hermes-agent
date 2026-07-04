@@ -2529,6 +2529,12 @@ class TestParseWakeGate:
         from cron.scheduler import _parse_wake_gate
         assert _parse_wake_gate('{"wakeAgent": false}') is False
 
+    def test_empty_sentinel_skips(self):
+        """The Ned dispatcher EMPTY sentinel is a machine gate, not prose context."""
+        from cron.scheduler import _parse_wake_gate
+        assert _parse_wake_gate("EMPTY") is False
+        assert _parse_wake_gate("debug line\nEMPTY\n") is False
+
     def test_wake_gate_true_wakes(self):
         from cron.scheduler import _parse_wake_gate
         assert _parse_wake_gate('{"wakeAgent": true}') is True
@@ -2608,6 +2614,21 @@ class TestRunJobWakeGate:
 
         with patch.object(scheduler, "_run_job_script",
                           return_value=(True, '{"wakeAgent": false}')), \
+             patch("run_agent.AIAgent") as agent_cls:
+            success, doc, final, err = scheduler.run_job(self._make_job())
+
+        assert success is True
+        assert err is None
+        assert final == SILENT_MARKER
+        assert "Script gate returned `wakeAgent=false`" in doc
+        agent_cls.assert_not_called()
+
+    def test_empty_sentinel_skips_agent_and_returns_silent(self):
+        """When a scanner emits EMPTY, cron must not build the full task prompt."""
+        from cron.scheduler import SILENT_MARKER
+        import cron.scheduler as scheduler
+
+        with patch.object(scheduler, "_run_job_script", return_value=(True, "EMPTY")), \
              patch("run_agent.AIAgent") as agent_cls:
             success, doc, final, err = scheduler.run_job(self._make_job())
 
