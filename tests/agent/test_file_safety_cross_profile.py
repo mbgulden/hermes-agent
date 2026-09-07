@@ -1,9 +1,16 @@
 """Tests for the cross-Hermes-profile write guard in agent/file_safety.
 
 The guard fires when a tool tries to write into another Hermes profile's
-skills/plugins/cron/memories directory. It's a soft guard — defense in
-depth, NOT a security boundary — but it prevents the agent from silently
+plugins/cron/memories directory. It's a soft guard — defense in depth,
+NOT a security boundary — but it prevents the agent from silently
 corrupting a profile that belongs to a different session.
+
+2026-09-07 (guard-relief, option 1): "skills" was removed from
+PROFILE_SCOPED_AREAS — cross-profile skill maintenance is a normal named-agent
+swarm operation (shared skills in agent-operations/, micro/, ...), and the
+guard was costing real minutes per legitimate fix. Test
+test_skills_cross_profile_intentionally_unguarded pins that exemption so a
+casual re-add fails loudly.
 
 Reference: May 2026 incident — a hermes-security profile session
 accidentally edited skills under both ~/.hermes/profiles/hermes-security/skills/
@@ -120,39 +127,59 @@ class TestClassifyCrossProfileTarget:
         )
         assert result is None
 
-    def test_security_writing_default_skill(self, fake_hermes, monkeypatch):
-        """The exact incident from May 2026."""
+    def test_security_writing_default_memories(self, fake_hermes, monkeypatch):
+        """Cross-profile memories write is still classified (2026-09-07:
+        skills was removed from the guarded set — memories is the area that
+        keeps the guard meaningful)."""
+        _set_active_home(monkeypatch, fake_hermes["security_home"])
+        from agent.file_safety import classify_cross_profile_target
+        result = classify_cross_profile_target(
+            str(fake_hermes["default_home"] / "memories" / "MEMORY.md")
+        )
+        assert result is not None
+        assert result["active_profile"] == "hermes-security"
+        assert result["target_profile"] == "default"
+        assert result["area"] == "memories"
+
+    def test_skills_cross_profile_intentionally_unguarded(self, fake_hermes, monkeypatch):
+        """Regression guard for the 2026-09-07 guard-relief (option 1):
+        cross-profile SKILLS writes are a normal swarm operation and must
+        NOT be classified. If this starts failing, someone re-added
+        "skills" to PROFILE_SCOPED_AREAS — that needs Michael's sign-off."""
         _set_active_home(monkeypatch, fake_hermes["security_home"])
         from agent.file_safety import classify_cross_profile_target
         result = classify_cross_profile_target(
             str(fake_hermes["default_home"] / "skills" / "foo" / "SKILL.md")
         )
-        assert result is not None
-        assert result["active_profile"] == "hermes-security"
-        assert result["target_profile"] == "default"
-        assert result["area"] == "skills"
+        assert result is None
+        # same for the named-profile direction
+        result = classify_cross_profile_target(
+            str(fake_hermes["coder_home"] / "skills" / "foo" / "SKILL.md")
+        )
+        assert result is None
 
-    def test_default_writing_security_skill(self, fake_hermes, monkeypatch):
+    def test_default_writing_security_memories(self, fake_hermes, monkeypatch):
         """Inverse direction — default-profile session reaching into a named profile."""
         _set_active_home(monkeypatch, fake_hermes["default_home"])
         from agent.file_safety import classify_cross_profile_target
         result = classify_cross_profile_target(
-            str(fake_hermes["security_home"] / "skills" / "foo" / "SKILL.md")
+            str(fake_hermes["security_home"] / "memories" / "MEMORY.md")
         )
         assert result is not None
         assert result["active_profile"] == "default"
         assert result["target_profile"] == "hermes-security"
+        assert result["area"] == "memories"
 
     def test_named_to_named_cross_profile(self, fake_hermes, monkeypatch):
         _set_active_home(monkeypatch, fake_hermes["security_home"])
         from agent.file_safety import classify_cross_profile_target
         result = classify_cross_profile_target(
-            str(fake_hermes["coder_home"] / "skills" / "foo" / "SKILL.md")
+            str(fake_hermes["coder_home"] / "memories" / "MEMORY.md")
         )
         assert result is not None
         assert result["target_profile"] == "coder"
 
-    @pytest.mark.parametrize("area", ["skills", "plugins", "cron", "memories"])
+    @pytest.mark.parametrize("area", ["plugins", "cron", "memories"])
     def test_all_profile_scoped_areas_classified(self, fake_hermes, monkeypatch, area):
         _set_active_home(monkeypatch, fake_hermes["security_home"])
         from agent.file_safety import classify_cross_profile_target
@@ -196,7 +223,7 @@ class TestGetCrossProfileWarning:
         _set_active_home(monkeypatch, fake_hermes["security_home"])
         from agent.file_safety import get_cross_profile_warning
         warn = get_cross_profile_warning(
-            str(fake_hermes["default_home"] / "skills" / "foo" / "SKILL.md")
+            str(fake_hermes["default_home"] / "memories" / "MEMORY.md")
         )
         assert warn is not None
         # Must name BOTH profiles so the model knows which is which.
@@ -205,14 +232,23 @@ class TestGetCrossProfileWarning:
         # Must name the bypass kwarg.
         assert "cross_profile=True" in warn
         # Must reference the area.
-        assert "skills" in warn
+        assert "memories" in warn
 
     def test_warning_is_defense_in_depth_not_boundary(self, fake_hermes, monkeypatch):
         _set_active_home(monkeypatch, fake_hermes["security_home"])
         from agent.file_safety import get_cross_profile_warning
         warn = get_cross_profile_warning(
-            str(fake_hermes["default_home"] / "skills" / "foo" / "SKILL.md")
+            str(fake_hermes["default_home"] / "memories" / "MEMORY.md")
         )
         # Must self-document as defense-in-depth so future reviewers
         # don't promote it to a hard block.
         assert "not a security boundary" in warn.lower()
+
+    def test_skills_write_produces_no_warning(self, fake_hermes, monkeypatch):
+        """2026-09-07 guard-relief: cross-profile skills writes must not
+        surface a warning at all (they are legitimate swarm work)."""
+        _set_active_home(monkeypatch, fake_hermes["security_home"])
+        from agent.file_safety import get_cross_profile_warning
+        assert get_cross_profile_warning(
+            str(fake_hermes["default_home"] / "skills" / "foo" / "SKILL.md")
+        ) is None
