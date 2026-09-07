@@ -307,6 +307,18 @@ def get_read_block_error(path: str) -> Optional[str]:
 # as the dangerous-command approval flow — the agent is told the boundary
 # exists, and explicit user direction is required to cross it.
 #
+# 2026-09-07: ``skills`` removed from the guarded set (Michael, option 1
+# of the guard-relief review). Rationale: in a named-agent swarm that
+# explicitly coordinates on SHARED skills (agent-operations/, micro/, etc.),
+# a cross-profile skill write is normal work, not a confusion signal — the
+# guard bounced legitimate fixes (e.g. a profile fixing a canonical shared
+# skill script) back to "confirm with the user" and cost real minutes per
+# occurrence. Skills are the one area where cross-profile edits are
+# expected. ``memories``/``cron``/``plugins`` stay guarded: those are where
+# a confused agent silently corrupting a DIFFERENT session's state is the
+# real failure mode. Do NOT re-add ``skills`` without Michael's sign-off —
+# see the note in classify_cross_profile_target.
+#
 # Reference: May 2026 incident where a hermes-security profile session
 # edited skills under both ``~/.hermes/profiles/hermes-security/skills/``
 # AND ``~/.hermes/skills/`` (the default profile's skills) without realizing
@@ -316,7 +328,10 @@ def get_read_block_error(path: str) -> Optional[str]:
 # Profile-scoped directories under HERMES_HOME / <root> / <root>/profiles/<X>/
 # that should be guarded. Adding a new area here extends the guard with no
 # other code change.
-PROFILE_SCOPED_AREAS = ("skills", "plugins", "cron", "memories")
+# NOTE: "skills" is deliberately EXCLUDED (2026-09-07, guard-relief option 1)
+# — shared-skill maintenance across profiles is a normal swarm operation.
+# "plugins" stays for now; revisit if plugin maintenance hits the same wall.
+PROFILE_SCOPED_AREAS = ("plugins", "cron", "memories")
 
 
 def _resolve_active_profile_name() -> str:
@@ -346,10 +361,15 @@ def _resolve_active_profile_name() -> str:
 
 def classify_cross_profile_target(path: str) -> Optional[dict]:
     """Classify a write target as cross-profile if it lands in another
-    profile's scoped area (skills/plugins/cron/memories).
+    profile's scoped area (plugins/cron/memories).
+
+    ``skills`` is NOT classified: shared-skill maintenance across profiles
+    is a normal swarm operation (removed 2026-09-07, guard-relief option 1).
+    See the module comment above ``PROFILE_SCOPED_AREAS`` for rationale.
 
     Returns ``None`` when the target is outside Hermes scope, or is inside
-    the ACTIVE profile, or doesn't hit a profile-scoped area. Otherwise
+    the ACTIVE profile, or is a skills/ path (unguarded by design), or
+    doesn't hit a profile-scoped area. Otherwise
     returns a dict with:
 
       * ``active_profile``: name of the profile the agent is running as
