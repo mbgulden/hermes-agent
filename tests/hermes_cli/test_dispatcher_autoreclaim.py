@@ -13,7 +13,7 @@ in-gateway dispatch tick (main line 6726):
                                                 worker must never be killed
   (c) claim UNEXPIRED (any PID state)      -> not selected, untouched
   (d) claim EXPIRED + worker ALIVE but    -> reclaimed via the heartbeat-
-      heartbeat >1h stale                        stale backstop (#29747
+      heartbeat >30m stale                       stale backstop (#29747
                                                 gap 3) — the self-heal that
                                                 resolves the Oct 21
                                                 stuck-but-alive orphans
