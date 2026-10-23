@@ -699,14 +699,29 @@ class GatewayKanbanWatchersMixin:
         # (shared across profiles by design), so it serialises ALL gateways.
         self._kanban_dispatcher_lock_handle = None
         _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
+        # _lock_monitor is True only when we started out contended and must
+        # retry singleton acquisition every tick. It is False for "held"
+        # (we're the dispatcher) and for "unavailable" (no advisory locking —
+        # config-only control, nothing to retry). A monitor gateway runs no
+        # dispatch work until it wins the lock.
+        _lock_monitor = False
         _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
         if _lock_state == "contended":
+            # Another gateway holds the singleton lock right now. Historically
+            # this gateway logged "will NOT dispatch" and returned, opting out
+            # of dispatching for its whole lifetime. That left the board with
+            # no dispatcher at all once the original holder later died: the
+            # advisory flock is released on process exit and nothing ever
+            # re-acquired it. Enter monitor mode instead — the tick loop below
+            # retries acquisition every interval, so a lost startup race
+            # self-heals the moment the current holder releases the lock.
             logger.info(
                 "kanban dispatcher: another gateway already holds the dispatcher "
-                "lock (%s); this gateway will NOT dispatch.", _lock_path,
+                "lock (%s); entering monitor mode — will retry lock acquisition "
+                "every tick and dispatch once acquired.", _lock_path,
             )
-            return
-        if _lock_state == "held":
+            _lock_monitor = True
+        elif _lock_state == "held":
             self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
             logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
         else:
@@ -1111,6 +1126,56 @@ class GatewayKanbanWatchersMixin:
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
         )
         while self._running:
+            # Monitor-mode gate: a gateway that lost the startup singleton
+            # lock race retries acquisition every tick instead of opting out
+            # for life. If it wins, it becomes THE dispatcher for the rest of
+            # this process's life — from this tick onward it runs the full
+            # dispatch work below, exactly like a gateway that won at startup.
+            # No dispatch work happens while contended, so there is no window
+            # of two concurrent dispatchers: the previous holder must have
+            # released the lock (process exit or shutdown) before we can win
+            # it, and the per-tick tick-lock inside dispatch_once still
+            # serialises against `hermes kanban dispatch` one-shots.
+            if _lock_monitor:
+                _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
+                if _lock_state == "held":
+                    self._kanban_dispatcher_lock_handle = _lock_handle
+                    _lock_monitor = False
+                    logger.info(
+                        "kanban dispatcher: acquired singleton dispatcher lock "
+                        "(%s) after contention; becoming dispatcher now.",
+                        _lock_path,
+                    )
+                    # Fall through: run the full dispatch work below from this
+                    # tick onward, exactly like a gateway that won at startup.
+                elif _lock_state == "unavailable":
+                    # Locking cannot be performed (non-POSIX without flock, or
+                    # the status.py helpers are unimportable). Stop retrying —
+                    # proceed on config-only control, matching the startup
+                    # 'unavailable' path.
+                    _lock_monitor = False
+                    logger.warning(
+                        "kanban dispatcher: advisory lock unavailable at %s; "
+                        "proceeding on config control alone.", _lock_path,
+                    )
+                else:
+                    # Still contended — this tick is a pure no-op. Log at
+                    # debug: at a 60s interval, per-tick INFO would be spam
+                    # for a multi-day contention; the transition above is the
+                    # one line operators need.
+                    logger.debug(
+                        "kanban dispatcher: still contended for singleton "
+                        "lock (%s); retrying next tick.", _lock_path,
+                    )
+                    # Fall through to the interval sleep at the bottom of the
+                    # loop — do NOT run zombie reaping or dispatch work this
+                    # tick while another gateway is the dispatcher.
+                    slept = 0.0
+                    while slept < interval and self._running:
+                        await asyncio.sleep(min(1.0, interval - slept))
+                        slept += 1.0
+                    continue
+
             try:
                 # Reap zombie children before per-board work so a board DB
                 # failure cannot block cleanup of unrelated workers.
