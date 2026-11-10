@@ -138,6 +138,14 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
 # long single-call MCP workflows.
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 
+# Every task carries a runtime cap. An author who sets none gets this
+# default (4h): create_task() normalizes None to it, and the tasks
+# table DDL carries it as the column DEFAULT for any writer that
+# bypasses the kernel. Without it, a capless task silently opts out
+# of the dispatcher reap, the checkpoint warning tiers, the movement
+# signal, and every other cap-keyed protection (2026-11-10 build).
+DEFAULT_MAX_RUNTIME_SECONDS = 14400
+
 # If a worker's PID is still alive but its ``last_heartbeat_at`` is
 # older than this when ``release_stale_claims`` runs, treat the worker
 # as wedged and reclaim regardless of PID liveness (#29747 gap 3).
@@ -1040,7 +1048,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     worker_pid           INTEGER,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
-    max_runtime_seconds  INTEGER,
+    max_runtime_seconds  INTEGER DEFAULT 14400,
     last_heartbeat_at    INTEGER,
     -- Pointer into task_runs for the currently-active run (NULL if no
     -- run is in-flight). Denormalised for cheap reads.
@@ -1816,7 +1824,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             )
     if "max_runtime_seconds" not in cols:
         _add_column_if_missing(
-            conn, "tasks", "max_runtime_seconds", "max_runtime_seconds INTEGER"
+            conn, "tasks", "max_runtime_seconds", "max_runtime_seconds INTEGER DEFAULT 14400"
         )
     if "last_heartbeat_at" not in cols:
         _add_column_if_missing(
@@ -2269,7 +2277,9 @@ def create_task(
 
     ``max_runtime_seconds`` caps how long a worker may run before the
     dispatcher SIGTERMs (then SIGKILLs after a grace window) and
-    re-queues the task. ``None`` means no cap (default).
+    re-queues the task. ``None`` (the default) resolves to
+    ``DEFAULT_MAX_RUNTIME_SECONDS`` (14400s) — every task carries a
+    cap; pass an explicit value for a different one.
 
     ``skills`` is an optional list of skill names to force-load into
     the worker when dispatched. Stored as JSON; the dispatcher passes
@@ -2277,6 +2287,8 @@ def create_task(
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
     """
+    if max_runtime_seconds is None:
+        max_runtime_seconds = DEFAULT_MAX_RUNTIME_SECONDS
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")

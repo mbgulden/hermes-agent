@@ -1034,8 +1034,10 @@ def test_repeated_timeouts_auto_block_at_default_limit(kanban_home):
 
 
 def test_max_runtime_none_means_no_cap(kanban_home):
-    """A task with max_runtime_seconds=None is never timed out regardless
-    of how long it runs."""
+    """A freshly-claimed task with a live worker is never timed out
+    mid-flight, however old its started_at looks. (Pre-default-cap this
+    pinned the NULL-cap path; kernel-created tasks now carry the 14400
+    default, and the claim/worker liveness gate is what this pins.)"""
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="uncapped", assignee="worker")
@@ -2826,7 +2828,7 @@ def test_default_spawn_preserves_longer_terminal_timeout(kanban_home, monkeypatc
 
 
 def test_default_spawn_leaves_terminal_timeout_without_runtime_cap(kanban_home, monkeypatch):
-    """Uncapped tasks keep the existing terminal timeout behavior."""
+    """Legacy NULL-cap rows keep the existing terminal timeout behavior."""
     captured = {}
 
     class FakeProc:
@@ -2843,6 +2845,10 @@ def test_default_spawn_leaves_terminal_timeout_without_runtime_cap(kanban_home, 
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="uncapped", assignee="ops")
+        # Kernel-created tasks always carry a cap since the default-cap
+        # build (2026-11-10); force the legacy NULL-cap row this test pins.
+        conn.execute("UPDATE tasks SET max_runtime_seconds = NULL WHERE id = ?", (tid,))
+        conn.commit()
         task = kb.get_task(conn, tid)
         workspace = kb.resolve_workspace(task)
         kb._default_spawn(task, str(workspace))
@@ -2851,6 +2857,36 @@ def test_default_spawn_leaves_terminal_timeout_without_runtime_cap(kanban_home, 
 
     assert captured["env"]["TERMINAL_TIMEOUT"] == "180"
     assert "TERMINAL_MAX_FOREGROUND_TIMEOUT" not in captured["env"]
+
+
+def test_default_spawn_applies_default_cap_terminal_timeout(kanban_home, monkeypatch):
+    """A task created without an explicit cap gets the 14400 default, and
+    spawn raises the terminal timeout to just under it (cap - 30)."""
+    captured = {}
+
+    class FakeProc:
+        pid = 126
+
+    def fake_popen(cmd, **kwargs):
+        captured["env"] = kwargs.get("env", {})
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setenv("TERMINAL_TIMEOUT", "180")
+    monkeypatch.delenv("TERMINAL_MAX_FOREGROUND_TIMEOUT", raising=False)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="default capped", assignee="ops")
+        task = kb.get_task(conn, tid)
+        assert task.max_runtime_seconds == 14400
+        workspace = kb.resolve_workspace(task)
+        kb._default_spawn(task, str(workspace))
+    finally:
+        conn.close()
+
+    assert captured["env"]["TERMINAL_TIMEOUT"] == "14370"
+    assert captured["env"]["TERMINAL_MAX_FOREGROUND_TIMEOUT"] == "14370"
 
 
 def test_build_worker_context_includes_runtime_timeout_budget(kanban_home, monkeypatch):
@@ -4505,7 +4541,13 @@ def test_dispatch_once_stale_disabled_when_timeout_zero(kanban_home, monkeypatch
     # from reclaiming. Only stale detection (disabled via timeout=0) is tested.
 
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="skip-stale", assignee="worker")
+        # Explicit large cap: since the default-cap build (2026-11-10) a
+        # capless create carries 14400, and the 5h backdate below would
+        # trip runtime-cap enforcement (SIGTERM to the worker pid —
+        # which is this test process). The large cap isolates the
+        # stale-detection path this test pins.
+        t = kb.create_task(conn, title="skip-stale", assignee="worker",
+                           max_runtime_seconds=86400)
         kb.claim_task(conn, t)
         # Claim sets worker_pid to 0 initially. Set it to os.getpid() so the
         # crash detector sees a live PID and skips it.
