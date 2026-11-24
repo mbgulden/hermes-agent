@@ -3288,6 +3288,26 @@ def claim_task(
                 """,
                 (now, int(stale["current_run_id"])),
             )
+            # The run this lock belonged to is ended by now (closed just
+            # above, or by an earlier claim attempt that left the task-row
+            # lock behind - the stuck shape the bridge retry ladder can
+            # produce by flipping a running task back to ready without
+            # clearing the lock). A ready task whose current run is ended
+            # holds a dead lock: clear the task-row lock fields in the
+            # same txn so the CAS below can succeed. A genuinely live run
+            # implies status='running', so this block never fires for it
+            # and the live-claim guard is unchanged.
+            conn.execute(
+                """
+                UPDATE tasks
+                   SET claim_lock = NULL, claim_expires = NULL,
+                       current_run_id = NULL, worker_pid = NULL,
+                       last_heartbeat_at = NULL
+                 WHERE id = ? AND status = 'ready'
+                   AND current_run_id = ?
+                """,
+                (task_id, int(stale["current_run_id"])),
+            )
         cur = conn.execute(
             """
             UPDATE tasks
